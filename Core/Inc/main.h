@@ -61,6 +61,10 @@ void Error_Handler(void);
 #define LEFT_OUT2_GPIO_Port GPIOB
 #define LEFT_OUT1_Pin GPIO_PIN_8
 #define LEFT_OUT1_GPIO_Port GPIOA
+#define RIGHT_OUT_Pin GPIO_PIN_9
+#define RIGHT_OUT_GPIO_Port GPIOA
+#define BASS_OUT_Pin GPIO_PIN_10
+#define BASS_OUT_GPIO_Port GPIOA
 
 /* USER CODE BEGIN Private defines */
 

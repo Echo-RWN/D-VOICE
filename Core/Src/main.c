@@ -21,7 +21,7 @@
 #include "adc.h"
 #include "tim.h"
 #include "gpio.h"
-
+#include <math.h>
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 
@@ -45,14 +45,22 @@
 /* Private variables ---------------------------------------------------------*/
 
 /* USER CODE BEGIN PV */
-uint16_t adc_sample_value = 0;  // ADC采样值（0~4095）
-uint32_t pwm_compare_value = 0; // PWM比较值（0~424）
-// 核心参数（高音质适配）
+// 三声道ADC采样值（0~4095）
+uint16_t adc_sample_value[3] = {0, 0, 0};
+// 三声道PWM比较值（0~424）
+uint32_t pwm_compare_value[3] = {0, 0, 0};
+
+// 低音低通滤波 500Hz
+#define BASS_CH 2
+#define Fs 50000.0f
+#define Fc 500.0f
+#define LP_ALPHA (2*M_PI*Fc)/(2*M_PI*Fc + Fs)
 #define TIM1_ARR 424              // TIM1 ARR值424（400kHz载波）
 #define ADC_MAX_VALUE 4095        // 12位ADC最大值
 #define ADC_MID_VALUE 2048        // ADC中点（1.65V偏置）
 #define PWM_MID_VALUE 212         // PWM中点212（50%占空比）
 #define GAIN_FACTOR 1.0f          // 增益系数（可调整，1.0为无增益，最大1.5避免削波）
+static uint16_t bass_prev = ADC_MID_VALUE;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -68,36 +76,48 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
   // 仅处理TIM6中断，防止其他定时器干扰
   if (htim == NULL || htim->Instance != TIM6) return;
 
-  // 1. 启动ADC采样（单次，低噪声）
+  // 1. 启动ADC采样（单次模式，连续采样3个通道）
   HAL_ADC_Start(&hadc1);
 
-  // 2. 等待采样完成（超时1ms，中断快速执行）
+  // 2. 等待采样完成（超时1ms，保证中断快速执行）
   if (HAL_ADC_PollForConversion(&hadc1, 1) == HAL_OK)
   {
-    // 3. 读取采样值（右对齐，直接使用）
-    adc_sample_value = HAL_ADC_GetValue(&hadc1);
+    // 3. 读取3个声道的ADC采样值（按Sequence顺序）
+    adc_sample_value[0] = HAL_ADC_GetValue(&hadc1); // 声道1（原有通道）
+    HAL_ADC_PollForConversion(&hadc1, 1);           // 等待下一个通道采样完成
+    adc_sample_value[1] = HAL_ADC_GetValue(&hadc1); // 声道2（PA1/IN1）
+    HAL_ADC_PollForConversion(&hadc1, 1);           // 等待下一个通道采样完成
+    adc_sample_value[2] = HAL_ADC_GetValue(&hadc1); // 声道3（PA2/IN2）
+    // 第一阶低音500Hz低通滤波
+    adc_sample_value[BASS_CH] = LP_ALPHA*adc_sample_value[BASS_CH] + (1-LP_ALPHA)*bass_prev;
+    bass_prev = adc_sample_value[BASS_CH];
+    // 第二阶低音500Hz低通滤波
+    adc_sample_value[BASS_CH] = LP_ALPHA*adc_sample_value[BASS_CH] + (1-LP_ALPHA)*bass_prev;
+    bass_prev = adc_sample_value[BASS_CH];
 
-    // 4. 高音质中点对称映射（避免偏置失真）
-    // 步骤1：计算ADC相对中点的偏移
-    int32_t adc_offset = (int32_t)adc_sample_value - ADC_MID_VALUE;
-    // 步骤2：应用增益（避免削波）
-    adc_offset = (int32_t)((float)adc_offset * GAIN_FACTOR);
-    // 步骤3：映射到PWM偏移（线性，无失真）
-    int32_t pwm_offset = (adc_offset * PWM_MID_VALUE) / ADC_MID_VALUE;
-    // 步骤4：计算最终PWM值
-    pwm_compare_value = PWM_MID_VALUE + pwm_offset;
+    // 4. 遍历处理每个声道的ADC→PWM映射（复用逻辑，减少冗余）
+    for (uint8_t ch = 0; ch < 3; ch++)
+    {
+      // 中点对称映射（避免偏置失真）
+      int32_t adc_offset = (int32_t)adc_sample_value[ch] - ADC_MID_VALUE;
+      adc_offset = (int32_t)((float)adc_offset * GAIN_FACTOR);
+      int32_t pwm_offset = (adc_offset * PWM_MID_VALUE) / ADC_MID_VALUE;
+      pwm_compare_value[ch] = PWM_MID_VALUE + pwm_offset;
 
-    // 5. 边界保护（防止削波，保证音质）
-    pwm_compare_value = (pwm_compare_value > TIM1_ARR) ? TIM1_ARR : pwm_compare_value;
-    pwm_compare_value = (pwm_compare_value < 0) ? 0 : pwm_compare_value;
+      // 边界保护（防止削波）
+      pwm_compare_value[ch] = (pwm_compare_value[ch] > TIM1_ARR) ? TIM1_ARR : pwm_compare_value[ch];
+      pwm_compare_value[ch] = (pwm_compare_value[ch] < 0) ? 0 : pwm_compare_value[ch];
+    }
 
-    // 6. 原子操作更新PWM（避免中断抖动，音质更稳）
+    // 5. 原子操作更新所有PWM通道（避免中断抖动，保证同步）
     __disable_irq();
-    __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, pwm_compare_value);
+    __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, pwm_compare_value[0]); // 声道1→CH1
+    __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_2, pwm_compare_value[1]); // 声道2→CH2（PA9）
+    __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_3, pwm_compare_value[2]); // 声道3→CH3（PA10）
     __enable_irq();
   }
 
-  // 7. 停止ADC，降低功耗+减少噪声
+  // 6. 停止ADC，降低功耗+减少噪声
   HAL_ADC_Stop(&hadc1);
 }
 /* USER CODE END 0 */
@@ -125,7 +145,6 @@ int main(void)
   /* Configure the system clock */
   SystemClock_Config();
 
-
   /* USER CODE BEGIN SysInit */
 
   /* USER CODE END SysInit */
@@ -133,10 +152,6 @@ int main(void)
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
   MX_ADC1_Init();
-
-  MX_GPIO_Init();
-  MX_ADC1_Init();
-
   MX_TIM1_Init();
   MX_TIM6_Init();
   /* USER CODE BEGIN 2 */
@@ -152,12 +167,23 @@ int main(void)
   }
 
   // 3. 启动TIM1主PWM+互补PWM（400kHz载波）
+  //声道1：PA8和PB13
   if (HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1) != HAL_OK)
   {
     Error_Handler();
   }
   // 启动互补PWM（PB13），全桥核心
   if (HAL_TIMEx_PWMN_Start(&htim1, TIM_CHANNEL_1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  // 声道2：CH2（PA9）
+  if (HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  // 声道3：CH3（PA10）
+  if (HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_3) != HAL_OK)
   {
     Error_Handler();
   }
