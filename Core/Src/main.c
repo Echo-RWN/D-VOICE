@@ -1,4 +1,5 @@
 /* USER CODE BEGIN Header */
+#include <math.h>
 /**
   ******************************************************************************
   * @file           : main.c
@@ -21,7 +22,7 @@
 #include "adc.h"
 #include "tim.h"
 #include "gpio.h"
-#include <math.h>
+
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 
@@ -52,15 +53,15 @@ uint32_t pwm_compare_value[3] = {0, 0, 0};
 
 // 低音低通滤波 500Hz
 #define BASS_CH 2
-#define Fs 50000.0f
-#define Fc 500.0f
+#define Fs 50000.0f//采样率
+#define Fc 500.0f//截止频率
 #define LP_ALPHA (2*M_PI*Fc)/(2*M_PI*Fc + Fs)
 #define TIM1_ARR 424              // TIM1 ARR值424（400kHz载波）
 #define ADC_MAX_VALUE 4095        // 12位ADC最大值
 #define ADC_MID_VALUE 2048        // ADC中点（1.65V偏置）
 #define PWM_MID_VALUE 212         // PWM中点212（50%占空比）
 #define GAIN_FACTOR 1.0f          // 增益系数（可调整，1.0为无增益，最大1.5避免削波）
-static uint16_t bass_prev = ADC_MID_VALUE;
+static uint16_t bass_prev = ADC_MID_VALUE;//定义低音滤波初始值为ADC中点
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -80,18 +81,16 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
   HAL_ADC_Start(&hadc1);
 
   // 2. 等待采样完成（超时1ms，保证中断快速执行）
-  if (HAL_ADC_PollForConversion(&hadc1, 1) == HAL_OK)
+  if (HAL_ADC_PollForConversion(&hadc1, 1) == HAL_OK) // 轮询等待转换完成，超时时间1ms，保证中断快速执行
   {
     // 3. 读取3个声道的ADC采样值（按Sequence顺序）
     adc_sample_value[0] = HAL_ADC_GetValue(&hadc1); // 声道1（原有通道）
-    HAL_ADC_PollForConversion(&hadc1, 1);           // 等待下一个通道采样完成
+    HAL_ADC_PollForConversion(&hadc1, 1);    // 等待下一个通道采样完成
     adc_sample_value[1] = HAL_ADC_GetValue(&hadc1); // 声道2（PA1/IN1）
-    HAL_ADC_PollForConversion(&hadc1, 1);           // 等待下一个通道采样完成
+    HAL_ADC_PollForConversion(&hadc1, 1);    // 等待下一个通道采样完成
     adc_sample_value[2] = HAL_ADC_GetValue(&hadc1); // 声道3（PA2/IN2）
+
     // 第一阶低音500Hz低通滤波
-    adc_sample_value[BASS_CH] = LP_ALPHA*adc_sample_value[BASS_CH] + (1-LP_ALPHA)*bass_prev;
-    bass_prev = adc_sample_value[BASS_CH];
-    // 第二阶低音500Hz低通滤波
     adc_sample_value[BASS_CH] = LP_ALPHA*adc_sample_value[BASS_CH] + (1-LP_ALPHA)*bass_prev;
     bass_prev = adc_sample_value[BASS_CH];
 
@@ -99,18 +98,18 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
     for (uint8_t ch = 0; ch < 3; ch++)
     {
       // 中点对称映射（避免偏置失真）
-      int32_t adc_offset = (int32_t)adc_sample_value[ch] - ADC_MID_VALUE;
-      adc_offset = (int32_t)((float)adc_offset * GAIN_FACTOR);
-      int32_t pwm_offset = (adc_offset * PWM_MID_VALUE) / ADC_MID_VALUE;
-      pwm_compare_value[ch] = PWM_MID_VALUE + pwm_offset;
+      int32_t adc_offset = (int32_t)adc_sample_value[ch] - ADC_MID_VALUE;//减去ADC中点，得到交流音频信号（正负对称，消除直流偏置）
+      adc_offset = (int32_t)((float)adc_offset * GAIN_FACTOR);           //应用增益系数，放大/缩小音频信号
+      int32_t pwm_offset = (adc_offset * PWM_MID_VALUE) / ADC_MID_VALUE; //按比例映射到PWM偏移范围
+      pwm_compare_value[ch] = PWM_MID_VALUE + pwm_offset;                //加上PWM中点，得到最终PWM比较值
 
       // 边界保护（防止削波）
       pwm_compare_value[ch] = (pwm_compare_value[ch] > TIM1_ARR) ? TIM1_ARR : pwm_compare_value[ch];
       pwm_compare_value[ch] = (pwm_compare_value[ch] < 0) ? 0 : pwm_compare_value[ch];
     }
 
-    // 5. 原子操作更新所有PWM通道（避免中断抖动，保证同步）
-    __disable_irq();
+    // 5. 更新所有PWM通道（避免中断抖动，保证同步）
+    __disable_irq();//暂时屏蔽所有中断,保证同步
     __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, pwm_compare_value[0]); // 声道1→CH1
     __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_2, pwm_compare_value[1]); // 声道2→CH2（PA9）
     __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_3, pwm_compare_value[2]); // 声道3→CH3（PA10）
